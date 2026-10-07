@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <assert.h>
 
 #include "deck_hal.h"
 #include "lvgl.h"
@@ -22,6 +23,9 @@
 #include "esp_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
+#include "esp_wifi_netif.h"
+#include "esp_private/wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -39,6 +43,8 @@ static esp_timer_handle_t s_retry;
 static volatile bool s_ready;
 static volatile bool s_synced;
 static bool s_sntp_started;
+static bool s_netif_added; /* true between our guarded START and STOP; STA has no AUTOUP so is_netif_up stays false */
+static int s_start_count;
 
 static net_ap_t s_scan[SCAN_MAX];
 static size_t s_scan_n;
@@ -142,6 +148,114 @@ static void apply_config(const char *ssid, const char *pass)
 
 /* ---- Startup ------------------------------------------------------------- */
 
+/*
+ * Guarded Wi-Fi/netif handlers.
+ *
+ * Root cause of the boot crash on some Tab5 units:
+ *   assert failed: netif_add ... (netif already added)
+ * from esp_netif_start_api, triggered by WIFI_EVENT_STA_START.
+ *
+ * IDF's default wifi_start() calls esp_netif_action_start() unconditionally,
+ * which calls netif_add() on the same lwip netif. If the ESP32-C6 slave
+ * delivers STA_START twice (spontaneous start on slave boot + start in
+ * response to our esp_wifi_start(), or a retransmitted RPC event from a
+ * slave firmware revision that behaves slightly differently), the second
+ * START runs netif_add() on an already-listed netif and lwIP aborts.
+ *
+ * Fix: don't use esp_netif_create_default_wifi_sta() (which installs IDF's
+ * unguarded handlers). Attach the driver manually and install these guarded
+ * equivalents, which mirror components/esp_wifi/src/wifi_default.c but
+ * ignore a duplicate START when the netif is already up (and ignore a
+ * STOP when already down). Behaviour is otherwise identical.
+ */
+
+static void net_guard_wifi_start(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    (void)data;
+    if (s_sta == NULL) return;
+    s_start_count++;
+    ESP_LOGI(TAG, "STA_START #%d (added=%d)", s_start_count, (int)s_netif_added);
+    if (s_netif_added) {
+        ESP_LOGW(TAG, "duplicate STA_START #%d ignored (C6 sent start twice?)", s_start_count);
+        return;
+    }
+    s_netif_added = true; /* mark before action_start: STA has no AUTOUP so is_netif_up can't detect duplicates */
+    uint8_t mac[6];
+    wifi_netif_driver_t driver = esp_netif_get_io_driver(s_sta);
+    if (esp_wifi_get_if_mac(driver, mac) == ESP_OK) {
+        if (esp_wifi_is_if_ready_when_started(driver)) {
+            if (esp_wifi_register_if_rxcb(driver, esp_netif_receive, s_sta) != ESP_OK) {
+                ESP_LOGE(TAG, "rxcb register failed");
+                s_netif_added = false;
+                return;
+            }
+        }
+        esp_wifi_internal_reg_netstack_buf_cb(esp_netif_netstack_buf_ref, esp_netif_netstack_buf_free);
+        esp_netif_set_mac(s_sta, mac);
+    } else {
+        ESP_LOGE(TAG, "get mac failed");
+        s_netif_added = false;
+        return;
+    }
+    esp_netif_action_start(s_sta, base, event_id, data);
+}
+
+static void net_guard_wifi_stop(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    (void)data;
+    if (s_sta == NULL) return;
+    ESP_LOGI(TAG, "STA_STOP (added=%d)", (int)s_netif_added);
+    if (!s_netif_added) {
+        return; /* duplicate STOP or stop before start: nothing to tear down */
+    }
+    s_netif_added = false;
+    esp_netif_action_stop(s_sta, base, event_id, data);
+}
+
+static void net_guard_sta_connected(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    if (s_sta == NULL) return;
+    wifi_netif_driver_t driver = esp_netif_get_io_driver(s_sta);
+    if (!esp_wifi_is_if_ready_when_started(driver)) {
+        if (esp_wifi_register_if_rxcb(driver, esp_netif_receive, s_sta) != ESP_OK) {
+            ESP_LOGE(TAG, "rxcb register on connect failed");
+            return;
+        }
+    }
+    esp_netif_action_connected(s_sta, base, event_id, data);
+}
+
+static void net_guard_sta_disconnected(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    (void)data;
+    if (s_sta == NULL) return;
+    esp_netif_action_disconnected(s_sta, base, event_id, data);
+}
+
+static void net_guard_got_ip(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    if (s_sta == NULL) return;
+    if (esp_wifi_internal_set_sta_ip() != ESP_OK) {
+        ESP_LOGI(TAG, "esp_wifi_internal_set_sta_ip failed");
+    }
+    esp_netif_action_got_ip(s_sta, base, event_id, data);
+}
+
 static void net_task(void *arg)
 {
     (void)arg;
@@ -173,7 +287,21 @@ void net_init(void)
 {
     esp_netif_init();
     esp_event_loop_create_default();
-    s_sta = esp_netif_create_default_wifi_sta();
+    /* Manual attach + guarded handlers (see comment above): do NOT use
+     * esp_netif_create_default_wifi_sta(), its STA_START handler crashes on
+     * a duplicate START from some C6 firmware revisions. */
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_WIFI_STA();
+    s_sta                  = esp_netif_new(&cfg);
+    assert(s_sta != NULL);
+    ESP_ERROR_CHECK(esp_netif_attach_wifi_station(s_sta));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START, net_guard_wifi_start, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_STOP, net_guard_wifi_stop, NULL));
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, net_guard_sta_connected, NULL));
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, net_guard_sta_disconnected, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_guard_got_ip, NULL));
+    ESP_LOGI(TAG, "guarded netif handlers installed (fix v2: flag-based, STA has no AUTOUP)");
     esp_netif_set_hostname(s_sta, "deck");
 
     const esp_timer_create_args_t targs = {.callback = retry_cb, .name = "wifi_retry"};
